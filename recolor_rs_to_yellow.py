@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-from __future__ import annotations
-
 from pathlib import Path
 
-import cv2
 import numpy as np
+from PIL import Image
 
 
 INPUT_PATH = Path("/home/user/attachments/rs.jpeg")
@@ -12,49 +10,55 @@ OUTPUT_PATH = Path("/home/user/output/rs_yellow.jpeg")
 
 
 def main() -> None:
-    img = cv2.imread(str(INPUT_PATH), cv2.IMREAD_COLOR)
-    if img is None:
-        raise FileNotFoundError(f"Could not load input image: {INPUT_PATH}")
+    img = Image.open(INPUT_PATH).convert("RGB")
+    data = np.array(img, dtype=np.float32) / 255.0
 
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
-    h = hsv[:, :, 0]
-    s = hsv[:, :, 1]
-    v = hsv[:, :, 2]
+    r, g, b = data[:, :, 0], data[:, :, 1], data[:, :, 2]
 
-    # Keep black / near-black / neutral regions unchanged.
-    active = (s > 30.0) & (v > 25.0)
+    maxc = np.maximum(np.maximum(r, g), b)
+    minc = np.minimum(np.minimum(r, g), b)
+    v = maxc
+    s = np.zeros_like(maxc)
+    nonzero_max = maxc != 0
+    s[nonzero_max] = (maxc[nonzero_max] - minc[nonzero_max]) / maxc[nonzero_max]
 
-    # Target the teal/cyan metallic band while avoiding other colors.
-    teal_mask = active & (h >= 42.0) & (h <= 100.0)
+    delta = maxc - minc
+    h = np.zeros_like(maxc)
 
-    # Create a soft mask so the recolor blends cleanly at the edges.
-    soft_mask = teal_mask.astype(np.float32)
-    soft_mask = cv2.GaussianBlur(soft_mask, (0, 0), sigmaX=1.2, sigmaY=1.2)
-    soft_mask = np.clip(soft_mask, 0.0, 1.0)
+    mask = delta != 0
+    rm = mask & (maxc == r)
+    h[rm] = ((g[rm] - b[rm]) / delta[rm]) % 6
+    gm = mask & (maxc == g)
+    h[gm] = (b[gm] - r[gm]) / delta[gm] + 2
+    bm = mask & (maxc == b)
+    h[bm] = (r[bm] - g[bm]) / delta[bm] + 4
+    h = h / 6.0
 
-    target_hue = 30.0  # OpenCV hue for warm yellow/gold
-    new_h = h.copy()
-    new_h[teal_mask] = target_hue
-    feathered = (soft_mask > 0.0) & (~teal_mask)
-    new_h[feathered] = ((1.0 - soft_mask[feathered]) * h[feathered]) + (
-        soft_mask[feathered] * target_hue
-    )
+    non_bg = (s > 0.05) & (v > 0.05)
+    h[non_bg] = 0.167
 
-    # Slight saturation lift helps read as gold while preserving value/contrast.
-    sat_boost = 1.0 + (0.28 * soft_mask)
-    new_s = np.clip(s * sat_boost, 0.0, 255.0)
+    h6 = h * 6.0
+    i = np.floor(h6).astype(int) % 6
+    f = h6 - np.floor(h6)
+    p = v * (1 - s)
+    q = v * (1 - s * f)
+    t = v * (1 - s * (1 - f))
 
-    hsv[:, :, 0] = np.mod(new_h, 180.0)
-    hsv[:, :, 1] = new_s
-    hsv[:, :, 2] = v
+    result = np.zeros_like(data)
+    for idx, (ri, gi, bi) in enumerate(
+        [(v, t, p), (q, v, p), (p, v, t), (p, q, v), (t, p, v), (v, p, q)]
+    ):
+        mask_i = i == idx
+        result[:, :, 0][mask_i] = ri[mask_i]
+        result[:, :, 1][mask_i] = gi[mask_i]
+        result[:, :, 2][mask_i] = bi[mask_i]
 
-    result = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+    result[~non_bg] = data[~non_bg]
+
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    ok = cv2.imwrite(str(OUTPUT_PATH), result, [cv2.IMWRITE_JPEG_QUALITY, 95])
-    if not ok:
-        raise RuntimeError(f"Failed to write output image: {OUTPUT_PATH}")
-
-    print(f"Saved {OUTPUT_PATH}")
+    result_img = Image.fromarray((result * 255).astype(np.uint8), "RGB")
+    result_img.save(OUTPUT_PATH, quality=95)
+    print(f"Done! Saved {OUTPUT_PATH}")
 
 
 if __name__ == "__main__":
